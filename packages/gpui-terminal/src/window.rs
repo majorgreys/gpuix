@@ -383,12 +383,16 @@ impl WindowInner {
 
     fn handle_resize(&self, size: TerminalSize) {
         let size = with_pixel_fallback(size);
+        // Re-derive the scale from the new cell size. A pane can open before its
+        // terminal knows its pixel size (Rex reports an 8x16 placeholder cell for a
+        // pane no client displays), and the real size only arrives as a resize.
         let scale_factor = {
             let mut state = self.state.borrow_mut();
             if state.size == size {
                 return;
             }
             state.size = size;
+            state.scale_factor = scale_factor_for(size);
             state.scale_factor
         };
         let logical_size = self.logical_size();
@@ -760,7 +764,21 @@ fn unpremultiply(pixels: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::unpremultiply;
+    use super::{scale_factor_for, unpremultiply};
+    use crate::tty::TerminalSize;
+
+    #[test]
+    fn scale_follows_cell_height() {
+        if std::env::var_os("GPUI_TERMINAL_SCALE").is_some() {
+            return;
+        }
+        // Rex's placeholder for a pane no client displays: 80x24 cells of 8x16.
+        let placeholder = TerminalSize { columns: 80, rows: 24, width: 640, height: 384 };
+        // The same pane once displayed on a Retina screen: 16x35 cells.
+        let retina = TerminalSize { columns: 95, rows: 62, width: 1520, height: 2170 };
+        assert_eq!(scale_factor_for(placeholder), 1.);
+        assert_eq!(scale_factor_for(retina), 2.);
+    }
 
     #[test]
     fn unpremultiply_restores_straight_alpha() {
