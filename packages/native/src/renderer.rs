@@ -6080,8 +6080,16 @@ pub(crate) fn build_host_container(
         el = el.child(text_content(element, content, ctx));
     }
 
+    // A `<text>` whose children are all `<text>` nodes, at least one of them styled or
+    // linked, paints as one wrapped paragraph with a gpui `TextRun` per child.
+    let inline = inline_runs_text(element, style, ctx, window);
+    let has_inline = inline.is_some();
+    if let Some(inline) = inline {
+        el = el.child(inline);
+    }
+
     // Children
-    for &child_id in &element.children {
+    for &child_id in element.children.iter().filter(|_| !has_inline) {
         let child = build_element(child_id, ctx, window, cx);
         el = if overflow_x_only {
             el.child(gpui::div().flex_none().child(child))
@@ -6405,6 +6413,118 @@ fn text_content(
     })
 }
 
+/// Flatten `<text><text style=..>a</text>b<text href=..>c</text></text>` into one
+/// string plus runs. Returns `None` (old behaviour) unless every child is a text node and at
+/// least one carries a style or an `href`. A run can change family, weight, italic, colour,
+/// background and underline; gpui's `TextRun` has no font size, so size stays the parent's.
+fn inline_runs_text(
+    element: &crate::retained_tree::RetainedElement,
+    style: Option<&StyleDesc>,
+    ctx: &BuildCtx,
+    window: &gpui::Window,
+) -> Option<gpui::AnyElement> {
+    if element.element_type != "text" || element.content.is_some() || element.children.is_empty() {
+        return None;
+    }
+    let base = window.text_style();
+    let color_of = |s: Option<&StyleDesc>, fallback: gpui::Hsla| {
+        s.and_then(|s| s.color.as_deref())
+            .and_then(crate::color::parse_color_rgba)
+            .map(gpui::Hsla::from)
+            .unwrap_or(fallback)
+    };
+    let font_of = |s: Option<&StyleDesc>, mut f: gpui::Font| {
+        if let Some(s) = s {
+            if let Some(family) = &s.font_family {
+                f.family = family.clone().into();
+            }
+            if let Some(weight) = &s.font_weight {
+                f.weight = parse_font_weight(weight);
+            }
+            match s.font_style.as_deref() {
+                Some("italic") => f.style = gpui::FontStyle::Italic,
+                Some("normal") => f.style = gpui::FontStyle::Normal,
+                _ => {}
+            }
+        }
+        f
+    };
+    let base_font = font_of(style, base.font());
+    let base_color = color_of(style, base.color);
+
+    let mut text = String::new();
+    let mut runs: Vec<gpui::TextRun> = Vec::new();
+    let mut links: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let mut styled = false;
+    for child_id in &element.children {
+        let child = ctx.tree.elements.get(child_id)?;
+        if child.element_type != "text" {
+            return None;
+        }
+        let child_style = child.style.as_deref();
+        let href = child.custom_props().get("href").and_then(|v| v.as_str());
+        styled |= child_style.is_some() || href.is_some();
+        // A leaf holds `content`; a styled `<text>` holds one level of leaves.
+        let mut content = child.content.clone().unwrap_or_default();
+        for leaf_id in &child.children {
+            let leaf = ctx.tree.elements.get(leaf_id)?;
+            if leaf.element_type != "text" || !leaf.children.is_empty() {
+                return None;
+            }
+            content.push_str(leaf.content.as_deref().unwrap_or(""));
+        }
+        if content.is_empty() {
+            continue;
+        }
+        let start = text.len();
+        text.push_str(&content);
+        if let Some(href) = href {
+            links.push((start..text.len(), href.to_string()));
+        }
+        let underline = href.is_some()
+            || child_style.and_then(|s| s.text_decoration.as_deref()) == Some("underline");
+        runs.push(gpui::TextRun {
+            len: content.len(),
+            font: font_of(child_style, base_font.clone()),
+            color: color_of(child_style, base_color),
+            background_color: child_style
+                .and_then(|s| s.background_color.as_deref())
+                .and_then(crate::color::parse_color_rgba)
+                .map(gpui::Hsla::from),
+            underline: underline.then_some(gpui::UnderlineStyle {
+                color: None,
+                thickness: gpui::px(1.0),
+                wavy: false,
+            }),
+            strikethrough: None,
+        });
+    }
+    if !styled || text.is_empty() {
+        return None;
+    }
+    let on_link: Option<std::sync::Arc<dyn Fn(&str)>> = element.events().contains("linkClick").then(|| {
+        let callback = ctx.event_callback.clone();
+        let id = element.id;
+        std::sync::Arc::new(move |url: &str| {
+            let url = url.to_string();
+            emit_event_full(&callback, id, "linkClick", |p| p.value = Some(url));
+        }) as std::sync::Arc<dyn Fn(&str)>
+    });
+    Some(selectable_text(crate::text::SelectableText {
+        selectable: ctx.inherited.selectable,
+        links,
+        on_link,
+        ..crate::text::SelectableText::new(
+            element.id,
+            0,
+            gpui::SharedString::from(text),
+            Some(runs),
+            ctx.selection.clone(),
+            ctx.inherited.selection_wash,
+        )
+    }))
+}
+
 /// Explicit `userSelect` on this node. `None` means inherit; the ancestor
 /// that set the value already owns the start region.
 fn selection_start_flag(style: Option<&StyleDesc>) -> Option<bool> {
@@ -6663,6 +6783,11 @@ pub(crate) fn apply_styles<E: gpui::Styled>(mut el: E, style: &StyleDesc) -> E {
     }
     if let Some(ref weight) = style.font_weight {
         el = el.font_weight(parse_font_weight(weight));
+    }
+    match style.font_style.as_deref() {
+        Some("italic") => el = el.italic(),
+        Some("normal") => el = el.not_italic(),
+        _ => {}
     }
     // `textAlign` was in the style type but implemented nowhere.
     match style.text_align.as_deref() {
